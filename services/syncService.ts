@@ -1,4 +1,4 @@
-import { TestSession } from '../types';
+import { TestSession, UploadedDocument } from '../types';
 import { getCurrentIdToken } from './firebaseClient';
 
 export interface SyncPayload {
@@ -6,7 +6,7 @@ export interface SyncPayload {
     incompleteSessions: Record<string, TestSession>;
 }
 
-async function authedFetch<T>(url: string, method: 'GET' | 'POST', body?: any): Promise<T> {
+async function authedFetch<T>(url: string, method: 'GET' | 'POST' | 'DELETE', body?: any): Promise<T> {
     const idToken = await getCurrentIdToken();
     if (!idToken) throw new Error('Not signed in.');
 
@@ -75,4 +75,28 @@ export const mergeSyncPayloads = (local: SyncPayload, cloud: SyncPayload): SyncP
         sessions: Array.from(sessionsById.values()).sort((a, b) => a.date - b.date),
         incompleteSessions: incompleteById,
     };
+};
+
+// Uploaded study documents sync individually (one record per document), not bundled with
+// sessions — extracted text can be much larger than session data, so each one is synced on its
+// own as it's added or removed, rather than re-uploading the whole set on every change.
+export const uploadDocumentToSync = async (document: UploadedDocument): Promise<void> => {
+    await authedFetch<{ success: boolean }>('/api/sync/documents/upload', 'POST', { document });
+};
+
+export const deleteDocumentFromSync = async (id: string): Promise<void> => {
+    await authedFetch<{ success: boolean }>(`/api/sync/documents/${encodeURIComponent(id)}`, 'DELETE');
+};
+
+export const downloadSyncedDocuments = async (): Promise<UploadedDocument[]> => {
+    const result = await authedFetch<{ documents: UploadedDocument[] }>('/api/sync/documents', 'GET');
+    return result.documents || [];
+};
+
+// Merges local and cloud document lists by id — union of both, local wins on an id collision
+// (shouldn't normally happen; ids are randomly generated at upload time).
+export const mergeDocuments = (local: UploadedDocument[], cloud: UploadedDocument[]): UploadedDocument[] => {
+    const byId = new Map<string, UploadedDocument>();
+    [...cloud, ...local].forEach(d => byId.set(d.id, d));
+    return Array.from(byId.values());
 };

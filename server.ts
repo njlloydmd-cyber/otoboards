@@ -839,6 +839,61 @@ Your active review keeps this board preparation study bank clean, clear, and acc
     }
   });
 
+  // Uploaded study documents sync separately from the sessions blob above (one Firestore
+  // document per uploaded document, not bundled together) — extracted PDF/docx text can run
+  // to tens or hundreds of KB each, and bundling several into one record risks Firestore's
+  // 1MiB-per-document limit. Synced individually, on add/delete, rather than re-uploading the
+  // whole set on every change.
+  const MAX_SYNCED_DOC_BYTES = 900_000; // safety margin under Firestore's ~1MiB document limit
+
+  app.post("/api/sync/documents/upload", async (req, res) => {
+    try {
+      const decoded = await verifyAuthToken(req);
+      const db = getBankDb();
+      const { document } = req.body;
+      if (!document || typeof document.id !== "string" || typeof document.text !== "string") {
+        return res.status(400).json({ error: "A valid document object (with id and text) is required." });
+      }
+      const approxBytes = Buffer.byteLength(JSON.stringify(document), "utf-8");
+      if (approxBytes > MAX_SYNCED_DOC_BYTES) {
+        return res.status(413).json({ error: `"${document.fileName || document.id}" is too large to sync (${Math.round(approxBytes / 1024)}KB). It still works on this device, just won't carry over to other devices.` });
+      }
+      await db.collection("users").doc(decoded.uid).collection("documents").doc(document.id).set(document);
+      res.json({ success: true });
+    } catch (e: any) {
+      console.error("Error uploading synced document:", e);
+      const status = e instanceof UnauthorizedError ? 401 : (e instanceof Error && e.message.includes("FIREBASE_SERVICE_ACCOUNT_BASE64") ? 503 : 500);
+      res.status(status).json({ error: e.message || "Failed to sync this document." });
+    }
+  });
+
+  app.delete("/api/sync/documents/:id", async (req, res) => {
+    try {
+      const decoded = await verifyAuthToken(req);
+      const db = getBankDb();
+      await db.collection("users").doc(decoded.uid).collection("documents").doc(req.params.id).delete();
+      res.json({ success: true });
+    } catch (e: any) {
+      console.error("Error deleting synced document:", e);
+      const status = e instanceof UnauthorizedError ? 401 : (e instanceof Error && e.message.includes("FIREBASE_SERVICE_ACCOUNT_BASE64") ? 503 : 500);
+      res.status(status).json({ error: e.message || "Failed to remove this document from sync." });
+    }
+  });
+
+  app.get("/api/sync/documents", async (req, res) => {
+    try {
+      const decoded = await verifyAuthToken(req);
+      const db = getBankDb();
+      const snapshot = await db.collection("users").doc(decoded.uid).collection("documents").get();
+      const documents = snapshot.docs.map((d) => d.data());
+      res.json({ documents });
+    } catch (e: any) {
+      console.error("Error listing synced documents:", e);
+      const status = e instanceof UnauthorizedError ? 401 : (e instanceof Error && e.message.includes("FIREBASE_SERVICE_ACCOUNT_BASE64") ? 503 : 500);
+      res.status(status).json({ error: e.message || "Failed to load your synced documents." });
+    }
+  });
+
   // Serve static assets / Vite in development
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({

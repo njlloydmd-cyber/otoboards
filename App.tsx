@@ -13,7 +13,7 @@ import { ALL_DIFFICULTIES, ALL_SUBSPECIALTIES, ALL_TEST_MODES, MODE_DESCRIPTIONS
 import { generateQuestions, askFollowUpQuestion, reportQuestionError, nameDocument, extractDocument } from './services/claudeService';
 import { addQuestionToBank, getQuestionBankCount, sampleFromQuestionBank } from './services/questionBankService';
 import { isSyncConfigured, signInWithGoogle, signOutUser, onAuthStateChanged, type User } from './services/firebaseClient';
-import { uploadSyncData, downloadSyncData, mergeSyncPayloads } from './services/syncService';
+import { uploadSyncData, downloadSyncData, mergeSyncPayloads, uploadDocumentToSync, deleteDocumentFromSync, downloadSyncedDocuments, mergeDocuments } from './services/syncService';
 import { getFilteredCuratedQuestions } from './curatedQuestions';
 import { BarChart, Bar, XAxis, YAxis, Tooltip, Legend, ResponsiveContainer, RadarChart, PolarGrid, PolarAngleAxis, PolarRadiusAxis, Radar } from 'recharts';
 import { ArrowPathIcon, BookOpenIcon, BookmarkIcon, ChartBarIcon, CheckCircleIcon, PaperAirplaneIcon, SparklesIcon, XCircleIcon, FlagIcon, DocumentArrowUpIcon, TrashIcon, StarIcon, CircleStackIcon, UserCircleIcon } from './components/icons';
@@ -78,9 +78,15 @@ const App: React.FC = () => {
   const [currentUser, setCurrentUser] = useState<User | null>(null);
   const [syncStatus, setSyncStatus] = useState<'idle' | 'signing-in' | 'syncing' | 'error'>('idle');
   const [syncMessage, setSyncMessage] = useState<string | null>(null);
-  // True while the initial post-sign-in download/merge is in flight, so the auto-upload effect
-  // doesn't race it by uploading stale local data before the merge has happened.
+  // True while the initial post-sign-in download/merge is in flight, so the auto-upload effects
+  // don't race it by uploading stale local data before the merge has happened.
   const isMergingRef = useRef(false);
+  // Tracks which document ids are currently believed to be correctly reflected in the cloud,
+  // so the diffing effect below only uploads genuinely new documents, not everything every time.
+  const syncedDocIdsRef = useRef<Set<string>>(new Set());
+  // Tracks the full set of local document ids as of the last diff, so a document disappearing
+  // from this set (the trash button) can be detected and mirrored as a cloud deletion.
+  const prevDocIdsRef = useRef<Set<string>>(new Set());
 
   useEffect(() => {
     return onAuthStateChanged((user) => {
@@ -98,23 +104,48 @@ const App: React.FC = () => {
       isMergingRef.current = true;
       setSyncStatus('syncing');
       try {
-        const cloudData = await downloadSyncData();
+        const [cloudData, cloudDocuments] = await Promise.all([
+          downloadSyncData(),
+          downloadSyncedDocuments().catch((e) => {
+            console.warn('Failed to download synced documents (continuing without them):', e);
+            return [] as UploadedDocument[];
+          }),
+        ]);
         if (cancelled) return;
 
         const localData = { sessions, incompleteSessions };
+        const cloudDocIds = new Set(cloudDocuments.map(d => d.id));
+        const localOnlyDocuments = allUploadedDocuments.filter(d => d.status === 'ready' && !cloudDocIds.has(d.id));
+        const mergedDocuments = mergeDocuments(allUploadedDocuments, cloudDocuments);
 
+        let sessionMessage: string;
         if (cloudData === null) {
           // First time this account has ever synced — upload local data as-is.
           await uploadSyncData(localData);
-          setSyncMessage(sessions.length > 0 ? `Backed up ${sessions.length} session(s) to your account.` : null);
+          sessionMessage = sessions.length > 0 ? `Backed up ${sessions.length} session(s)` : '';
         } else {
           const merged = mergeSyncPayloads(localData, cloudData);
           const newlyAdded = merged.sessions.length - sessions.length;
           setSessions(merged.sessions);
           setIncompleteSessions(merged.incompleteSessions);
           await uploadSyncData(merged); // keep the cloud consistent with the merged result
-          setSyncMessage(newlyAdded > 0 ? `Synced ${newlyAdded} session(s) from your other device(s).` : 'Synced — all caught up.');
+          sessionMessage = newlyAdded > 0 ? `Synced ${newlyAdded} session(s) from your other device(s)` : '';
         }
+
+        setAllUploadedDocuments(mergedDocuments);
+        // Push up any documents that existed locally but weren't in the cloud yet.
+        await Promise.all(localOnlyDocuments.map(d => uploadDocumentToSync(d).catch((e) => {
+          console.warn(`Failed to sync document "${d.fileName}" during initial merge:`, e);
+        })));
+
+        // Everything now reflected in mergedDocuments is considered in sync from here on —
+        // the diffing effect below only needs to react to changes from this point forward.
+        syncedDocIdsRef.current = new Set(mergedDocuments.map(d => d.id));
+        prevDocIdsRef.current = new Set(mergedDocuments.map(d => d.id));
+
+        const docMessage = cloudDocuments.length > 0 ? `${cloudDocuments.length} document(s) from your other device(s)` : '';
+        const parts = [sessionMessage, docMessage].filter(Boolean);
+        setSyncMessage(parts.length > 0 ? `Synced: ${parts.join(', ')}.` : 'Synced — all caught up.');
         setSyncStatus('idle');
       } catch (e: any) {
         console.error('Initial sync failed:', e);
@@ -128,8 +159,8 @@ const App: React.FC = () => {
     })();
 
     return () => { cancelled = true; };
-    // Intentionally only re-runs when the signed-in user changes, not on every session change
-    // (the separate auto-upload effect below handles ongoing syncing after this initial merge).
+    // Intentionally only re-runs when the signed-in user changes, not on every session/document
+    // change (the separate effects below handle ongoing syncing after this initial merge).
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [currentUser]);
 
@@ -140,6 +171,30 @@ const App: React.FC = () => {
       console.warn('Background sync upload failed (will retry on next change):', e);
     });
   }, [currentUser, sessions, incompleteSessions]);
+
+  // Documents sync individually (not as one big blob, since extracted text can be large) — this
+  // diffs the current local document list against what we last knew, uploading anything new and
+  // ready, and mirroring any local deletion to the cloud.
+  useEffect(() => {
+    if (!currentUser || isMergingRef.current) return;
+
+    const allCurrentIds = new Set(allUploadedDocuments.map(d => d.id));
+    const toUpload = allUploadedDocuments.filter(d => d.status === 'ready' && !syncedDocIdsRef.current.has(d.id));
+    const toDelete: string[] = [...prevDocIdsRef.current].filter((id: string) => !allCurrentIds.has(id) && syncedDocIdsRef.current.has(id));
+
+    toUpload.forEach((doc) => {
+      uploadDocumentToSync(doc)
+        .then(() => syncedDocIdsRef.current.add(doc.id))
+        .catch((e) => console.warn(`Failed to sync document "${doc.fileName}":`, e));
+    });
+    toDelete.forEach((id) => {
+      deleteDocumentFromSync(id)
+        .then(() => syncedDocIdsRef.current.delete(id))
+        .catch((e) => console.warn(`Failed to remove synced document ${id}:`, e));
+    });
+
+    prevDocIdsRef.current = allCurrentIds;
+  }, [currentUser, allUploadedDocuments]);
 
   const handleSignIn = async () => {
     setSyncStatus('signing-in');
