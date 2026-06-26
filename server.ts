@@ -2,6 +2,7 @@ import express from "express";
 import path from "path";
 import crypto from "crypto";
 import mammoth from "mammoth";
+import { PDFDocument } from "pdf-lib";
 import { createServer as createViteServer } from "vite";
 import Anthropic from "@anthropic-ai/sdk";
 import { initializeApp, cert, type ServiceAccount } from "firebase-admin/app";
@@ -219,6 +220,34 @@ async function startServer() {
     return Math.min(48000, 2000 + count * 1100);
   }
 
+  // Splits a PDF into page-range chunks (each its own small, valid PDF), so a large or scanned
+  // document can be transcribed as several smaller, faster Claude calls run in parallel instead
+  // of one slow mega-call. Wall-clock time ends up close to "the slowest chunk" rather than
+  // "the sum of every page".
+  async function splitPdfIntoChunks(
+    pdfBuffer: Buffer,
+    pagesPerChunk: number
+  ): Promise<{ base64: string; startPage: number; endPage: number }[]> {
+    const srcDoc = await PDFDocument.load(pdfBuffer);
+    const totalPages = srcDoc.getPageCount();
+    const chunks: { base64: string; startPage: number; endPage: number }[] = [];
+
+    for (let start = 0; start < totalPages; start += pagesPerChunk) {
+      const end = Math.min(start + pagesPerChunk, totalPages);
+      const chunkDoc = await PDFDocument.create();
+      const pageIndices = Array.from({ length: end - start }, (_, i) => start + i);
+      const copiedPages = await chunkDoc.copyPages(srcDoc, pageIndices);
+      copiedPages.forEach((page) => chunkDoc.addPage(page));
+      const chunkBytes = await chunkDoc.save();
+      chunks.push({
+        base64: Buffer.from(chunkBytes).toString("base64"),
+        startPage: start + 1,
+        endPage: end,
+      });
+    }
+    return chunks;
+  }
+
   // ----------------------------------------------------------------------------------------
   // Document extraction
   // ----------------------------------------------------------------------------------------
@@ -262,27 +291,96 @@ async function startServer() {
       }
 
       if (isPdf) {
-        const ai = getAI();
-        const response = await generateWithFallback(ai, {
-          max_tokens: 20000,
-          messages: [
-            {
-              role: "user",
-              content: [
-                { type: "document", source: { type: "base64", media_type: "application/pdf", data: base64Data } },
-                {
-                  type: "text",
-                  text: `You are an expert medical document transcriber. Transcribe this entire document ("${fileName}") to clean, readable text. Include all body text, headings, tables (as plain text), staging criteria, and numeric values exactly as written. Do not summarize, paraphrase, or omit content — this transcription will be used to write accurate exam questions. Return only the transcribed text, with no preamble or commentary.`,
-                },
-              ],
-            },
-          ],
-        });
-        const text = getTextFromMessage(response);
-        if (!text) {
-          return res.status(422).json({ error: "Claude could not extract any text from this PDF. It may be blank, password-protected, or exceed the page/size limit (try splitting it into smaller files)." });
+        const pdfBuffer = Buffer.from(base64Data, "base64");
+
+        let totalPages: number;
+        try {
+          const probeDoc = await PDFDocument.load(pdfBuffer);
+          totalPages = probeDoc.getPageCount();
+        } catch (e: any) {
+          return res.status(422).json({ error: `"${fileName}" couldn't be read as a PDF. It may be corrupted, password-protected, or not actually a PDF file.` });
         }
-        return res.json({ text, method: "claude-vision" });
+
+        const MAX_PAGES = 150;
+        if (totalPages > MAX_PAGES) {
+          return res.status(413).json({ error: `"${fileName}" has ${totalPages} pages, which is over the ${MAX_PAGES}-page limit per upload. Try splitting it into smaller files.` });
+        }
+
+        const ai = getAI();
+        const PAGES_PER_CHUNK = 8;
+
+        if (totalPages <= PAGES_PER_CHUNK) {
+          // Small enough that splitting would just add overhead — one call, as before.
+          const response = await generateWithFallback(ai, {
+            max_tokens: 20000,
+            messages: [
+              {
+                role: "user",
+                content: [
+                  { type: "document", source: { type: "base64", media_type: "application/pdf", data: base64Data } },
+                  {
+                    type: "text",
+                    text: `You are an expert medical document transcriber. Transcribe this entire document ("${fileName}") to clean, readable text. Include all body text, headings, tables (as plain text), staging criteria, and numeric values exactly as written. Do not summarize, paraphrase, or omit content — this transcription will be used to write accurate exam questions. Return only the transcribed text, with no preamble or commentary.`,
+                  },
+                ],
+              },
+            ],
+          });
+          const text = getTextFromMessage(response);
+          if (!text) {
+            return res.status(422).json({ error: "Claude could not extract any text from this PDF. It may be blank, password-protected, or made up of unreadable images." });
+          }
+          return res.json({ text, method: "claude-vision" });
+        }
+
+        // Larger document: split into page-range chunks, transcribe them in parallel. Each
+        // chunk is its own small, valid PDF, so this is much faster per-call than asking
+        // Claude to process the whole (potentially scanned, image-heavy) document at once —
+        // and total wall-clock time is close to the slowest single chunk, not their sum.
+        console.log(`Splitting "${fileName}" (${totalPages} pages) into chunks of ${PAGES_PER_CHUNK} pages for parallel transcription...`);
+        const chunks = await splitPdfIntoChunks(pdfBuffer, PAGES_PER_CHUNK);
+
+        const chunkResults = await Promise.all(
+          chunks.map(async (chunk) => {
+            try {
+              const response = await generateWithFallback(ai, {
+                max_tokens: 8000,
+                messages: [
+                  {
+                    role: "user",
+                    content: [
+                      { type: "document", source: { type: "base64", media_type: "application/pdf", data: chunk.base64 } },
+                      {
+                        type: "text",
+                        text: `You are an expert medical document transcriber. Transcribe pages ${chunk.startPage}-${chunk.endPage} of "${fileName}" (a partial excerpt from a larger document — only transcribe what's shown, don't comment on it being a fragment) to clean, readable text. Include all body text, headings, tables (as plain text), staging criteria, and numeric values exactly as written. Do not summarize, paraphrase, or omit content. Return only the transcribed text, with no preamble or commentary.`,
+                      },
+                    ],
+                  },
+                ],
+              });
+              return { startPage: chunk.startPage, text: getTextFromMessage(response) };
+            } catch (chunkError: any) {
+              console.warn(`Chunk pages ${chunk.startPage}-${chunk.endPage} of "${fileName}" failed to transcribe:`, chunkError);
+              return { startPage: chunk.startPage, text: "" };
+            }
+          })
+        );
+
+        // Promise.all preserves input order, so chunkResults is already in page order.
+        const successfulChunks = chunkResults.filter((r) => r.text);
+        const text = successfulChunks.map((r) => r.text).join("\n\n--- PAGE BREAK ---\n\n");
+
+        if (!text) {
+          return res.status(422).json({ error: "Claude could not extract any text from this PDF. It may be blank, password-protected, or made up of unreadable images." });
+        }
+        const failedCount = chunks.length - successfulChunks.length;
+        const finalText = failedCount > 0
+          ? `${text}\n\n[Note: ${failedCount} of ${chunks.length} page-sections of this document could not be transcribed (likely temporary high demand on Claude). The text above may be incomplete — consider re-uploading if questions generated from it seem to be missing content.]`
+          : text;
+        if (failedCount > 0) {
+          console.warn(`"${fileName}": ${failedCount} of ${chunks.length} chunks failed to transcribe; returning the rest with a notice.`);
+        }
+        return res.json({ text: finalText, method: "claude-vision-chunked" });
       }
 
       if (isImage) {
