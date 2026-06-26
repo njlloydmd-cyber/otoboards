@@ -4,16 +4,9 @@ services:
     runtime: node
     plan: free
     buildCommand: npm install && npm run build
-    startCommand: npm start
+    startCommand: NODE_ENV=production npm start
     envVars:
-      - key: NODE_ENV
-        value: production
-      # Render prompts you to fill these in during the Blueprint creation flow.
-      # Get ANTHROPIC_API_KEY from https://console.anthropic.com/settings/keys
       - key: ANTHROPIC_API_KEY
         sync: false
-      # Optional — only needed for the Question Bank feature. See README.md
-      # "Setting up the Question Bank" for how to generate this value. Leave
-      # blank in the prompt (just hit through) if you don't need it yet.
       - key: FIREBASE_SERVICE_ACCOUNT_BASE64
         sync: false
