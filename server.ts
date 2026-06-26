@@ -326,6 +326,26 @@ async function startServer() {
     return chunks;
   }
 
+  // Runs async work over a list with at most `limit` items in flight at once, instead of firing
+  // everything simultaneously. Base64-encoded PDF chunks are large (a chunk's base64 string can
+  // take roughly double its byte size in V8 memory, since JS strings are UTF-16), and a sizable
+  // scanned document split into several chunks, all in flight at once, can add up to real memory
+  // pressure on a constrained instance. This trades a bit of wall-clock time for a much lower
+  // peak memory footprint.
+  async function processInBatches<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+    const results: R[] = new Array(items.length);
+    let nextIndex = 0;
+    async function worker() {
+      while (nextIndex < items.length) {
+        const i = nextIndex++;
+        results[i] = await fn(items[i]);
+      }
+    }
+    const workers = Array.from({ length: Math.min(limit, items.length) }, () => worker());
+    await Promise.all(workers);
+    return results;
+  }
+
   // ----------------------------------------------------------------------------------------
   // Document extraction
   // ----------------------------------------------------------------------------------------
@@ -385,7 +405,10 @@ async function startServer() {
         }
 
         const ai = getAI();
-        const PAGES_PER_CHUNK = 8;
+        const PAGES_PER_CHUNK = 6;
+        // At most this many chunks' worth of base64 PDF data (and their in-flight Claude
+        // requests) are held in memory at once, regardless of how many chunks the document has.
+        const CHUNK_CONCURRENCY = 2;
 
         if (totalPages <= PAGES_PER_CHUNK) {
           // Small enough that splitting would just add overhead — one call, as before.
@@ -430,11 +453,10 @@ async function startServer() {
         // that backfired by making "missing content" salient, and the model sometimes wrote a
         // confused clarifying message instead of transcribing. Saying nothing about the
         // chunking at all sidesteps that failure mode entirely.
-        const chunkResults = await Promise.all(
-          chunks.map(async (chunk) => {
+        const chunkResults = await processInBatches(chunks, CHUNK_CONCURRENCY, async (chunk) => {
             try {
               const response = await generateWithFallback(ai, {
-                // Generous budget: a dense 8-page medical textbook excerpt can genuinely exceed
+                // Generous budget: a dense 6-page medical textbook excerpt can genuinely exceed
                 // a smaller budget — and unlike free-form text, a tool call that gets cut off by
                 // hitting max_tokens produces incomplete/unparseable JSON rather than a merely-
                 // truncated-but-readable string, so running out of room here is an outright
@@ -469,10 +491,9 @@ async function startServer() {
               console.warn(`Chunk pages ${chunk.startPage}-${chunk.endPage} of "${fileName}" failed to transcribe:`, chunkError);
               return { startPage: chunk.startPage, text: "" };
             }
-          })
-        );
+        });
 
-        // Promise.all preserves input order, so chunkResults is already in page order.
+        // processInBatches preserves input order, so chunkResults is already in page order.
         const successfulChunks = chunkResults.filter((r) => r.text);
         const text = successfulChunks.map((r) => r.text).join("\n\n--- PAGE BREAK ---\n\n");
 
