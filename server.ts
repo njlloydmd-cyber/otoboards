@@ -406,6 +406,9 @@ async function startServer() {
             tools: [transcriptionTool],
             tool_choice: { type: "tool", name: "submit_transcription" },
           });
+          if (response.stop_reason === "max_tokens") {
+            return res.status(422).json({ error: `Claude's transcription of "${fileName}" was cut off because it exceeded the output limit. Try splitting it into smaller files.` });
+          }
           const text = getTranscriptionFromMessage(response);
           if (!text || looksLikeRefusalOrCommentary(text)) {
             return res.status(422).json({ error: "Claude could not extract any text from this PDF. It may be blank, password-protected, or made up of unreadable images." });
@@ -431,7 +434,12 @@ async function startServer() {
           chunks.map(async (chunk) => {
             try {
               const response = await generateWithFallback(ai, {
-                max_tokens: 8000,
+                // Generous budget: a dense 8-page medical textbook excerpt can genuinely exceed
+                // a smaller budget — and unlike free-form text, a tool call that gets cut off by
+                // hitting max_tokens produces incomplete/unparseable JSON rather than a merely-
+                // truncated-but-readable string, so running out of room here is an outright
+                // failure, not a minor quality loss. Better to overprovision.
+                max_tokens: 20000,
                 messages: [
                   {
                     role: "user",
@@ -447,6 +455,10 @@ async function startServer() {
                 tools: [transcriptionTool],
                 tool_choice: { type: "tool", name: "submit_transcription" },
               });
+              if (response.stop_reason === "max_tokens") {
+                console.warn(`Chunk pages ${chunk.startPage}-${chunk.endPage} of "${fileName}" hit the max_tokens limit mid-generation — the tool call is likely incomplete; treating as failed.`);
+                return { startPage: chunk.startPage, text: "" };
+              }
               const text = getTranscriptionFromMessage(response);
               if (looksLikeRefusalOrCommentary(text)) {
                 console.warn(`Chunk pages ${chunk.startPage}-${chunk.endPage} of "${fileName}" returned refusal-like content instead of a transcription; treating as failed:`, text.slice(0, 200));
@@ -493,6 +505,9 @@ async function startServer() {
           tools: [transcriptionTool],
           tool_choice: { type: "tool", name: "submit_transcription" },
         });
+        if (response.stop_reason === "max_tokens") {
+          return res.status(422).json({ error: `Claude's transcription of "${fileName}" was cut off because it exceeded the output limit.` });
+        }
         const text = getTranscriptionFromMessage(response);
         if (!text || looksLikeRefusalOrCommentary(text)) {
           return res.status(422).json({ error: "Claude could not find any readable text in this image." });
