@@ -216,10 +216,16 @@ async function startServer() {
   // itself, rather than actual document content. A real transcription of a textbook page is
   // not going to contain phrasing like this.
   function looksLikeRefusalOrCommentary(text: string): boolean {
+    // A real transcription of even a single textbook page runs well into the hundreds of
+    // characters; several pages runs into the thousands. A refusal/clarifying message is
+    // typically a few sentences. Requiring BOTH a short length and a red-flag phrase avoids
+    // rejecting legitimate long-form content that happens to contain a flagged phrase
+    // somewhere within it (e.g. clinical text discussing what a study "did not include").
+    if (text.length > 600) return false;
     const lower = text.toLowerCase();
     const redFlags = [
       "i cannot", "i can't", "i don't have", "i do not have", "i'm only seeing", "i am only seeing",
-      "no pages", "not included", "not visible in", "as you've shared", "as you have shared",
+      "no pages", "not visible in the materials", "as you've shared", "as you have shared",
       "the document provided", "i can only work with", "let me know if you'd like",
       "the materials you have provided", "the materials you've provided", "i'd be happy to",
     ];
@@ -414,6 +420,13 @@ async function startServer() {
         console.log(`Splitting "${fileName}" (${totalPages} pages) into chunks of ${PAGES_PER_CHUNK} pages for parallel transcription...`);
         const chunks = await splitPdfIntoChunks(pdfBuffer, PAGES_PER_CHUNK);
 
+        // Each chunk's prompt deliberately says nothing about it being an "excerpt," a
+        // "fragment," or referencing the original document's page numbers — it's framed
+        // exactly like the single-PDF case above. An earlier version mentioned the chunk's
+        // position (e.g. "pages 9-16") and told the model not to comment on missing pages;
+        // that backfired by making "missing content" salient, and the model sometimes wrote a
+        // confused clarifying message instead of transcribing. Saying nothing about the
+        // chunking at all sidesteps that failure mode entirely.
         const chunkResults = await Promise.all(
           chunks.map(async (chunk) => {
             try {
@@ -426,12 +439,7 @@ async function startServer() {
                       { type: "document", source: { type: "base64", media_type: "application/pdf", data: chunk.base64 } },
                       {
                         type: "text",
-                        // Deliberately does NOT assert this excerpt's position (e.g. "pages 9-16") within
-                        // the original document — each chunk is its own self-contained PDF that Claude
-                        // will perceive as starting at page 1, and telling it otherwise creates a mismatch
-                        // it may try to "resolve" by second-guessing what it's looking at instead of just
-                        // transcribing it.
-                        text: `You are an expert medical document transcriber. This is one excerpt from a larger multi-page document called "${fileName}". Transcribe every page of THIS excerpt, exactly as shown, to clean, readable text. Include all body text, headings, tables (as plain text), staging criteria, and numeric values exactly as written. Do not summarize, paraphrase, or omit content. Do not comment on this being an excerpt, ask about missing pages, or write anything other than the transcription itself — call the submit_transcription tool with the result.`,
+                        text: `You are an expert medical document transcriber. Transcribe this document ("${fileName}") to clean, readable text. Include all body text, headings, tables (as plain text), staging criteria, and numeric values exactly as written. Do not summarize, paraphrase, or omit content. Call the submit_transcription tool with the result.`,
                       },
                     ],
                   },
