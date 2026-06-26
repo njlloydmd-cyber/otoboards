@@ -19,3 +19,17 @@ services:
       # blank in the prompt (just hit through) if you don't need it yet.
       - key: FIREBASE_SERVICE_ACCOUNT_BASE64
         sync: false
+      # The four below are for the OPTIONAL cross-device sync feature (Google sign-in).
+      # These are public values (safe to expose in the browser bundle — they are not secrets,
+      # unlike FIREBASE_SERVICE_ACCOUNT_BASE64 above), from Firebase Console → Project Settings
+      # → General → Your apps → (Web app) → SDK setup and configuration. See README.md
+      # "Setting up cross-device sync" for the full walkthrough. Leave all four blank if you
+      # don't want this feature — the app works fully without it.
+      - key: VITE_FIREBASE_API_KEY
+        sync: false
+      - key: VITE_FIREBASE_AUTH_DOMAIN
+        sync: false
+      - key: VITE_FIREBASE_PROJECT_ID
+        sync: false
+      - key: VITE_FIREBASE_APP_ID
+        sync: false

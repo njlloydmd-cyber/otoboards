@@ -12,9 +12,11 @@ import {
 import { ALL_DIFFICULTIES, ALL_SUBSPECIALTIES, ALL_TEST_MODES, MODE_DESCRIPTIONS } from './constants';
 import { generateQuestions, askFollowUpQuestion, reportQuestionError, nameDocument, extractDocument } from './services/claudeService';
 import { addQuestionToBank, getQuestionBankCount, sampleFromQuestionBank } from './services/questionBankService';
+import { isSyncConfigured, signInWithGoogle, signOutUser, onAuthStateChanged, type User } from './services/firebaseClient';
+import { uploadSyncData, downloadSyncData, mergeSyncPayloads } from './services/syncService';
 import { getFilteredCuratedQuestions } from './curatedQuestions';
 import { BarChart, Bar, XAxis, YAxis, Tooltip, Legend, ResponsiveContainer, RadarChart, PolarGrid, PolarAngleAxis, PolarRadiusAxis, Radar } from 'recharts';
-import { ArrowPathIcon, BookOpenIcon, BookmarkIcon, ChartBarIcon, CheckCircleIcon, PaperAirplaneIcon, SparklesIcon, XCircleIcon, FlagIcon, DocumentArrowUpIcon, TrashIcon, StarIcon, CircleStackIcon } from './components/icons';
+import { ArrowPathIcon, BookOpenIcon, BookmarkIcon, ChartBarIcon, CheckCircleIcon, PaperAirplaneIcon, SparklesIcon, XCircleIcon, FlagIcon, DocumentArrowUpIcon, TrashIcon, StarIcon, CircleStackIcon, UserCircleIcon } from './components/icons';
 
 // --- Helper Components ---
 
@@ -71,6 +73,93 @@ const App: React.FC = () => {
   const [allUploadedDocuments, setAllUploadedDocuments] = useState<UploadedDocument[]>([]);
   const [sessionToDiscard, setSessionToDiscard] = useState<string | null>(null);
   const [isViewingHistoricalSession, setIsViewingHistoricalSession] = useState(false);
+
+  // --- Optional cross-device sync (Google sign-in) ---
+  const [currentUser, setCurrentUser] = useState<User | null>(null);
+  const [syncStatus, setSyncStatus] = useState<'idle' | 'signing-in' | 'syncing' | 'error'>('idle');
+  const [syncMessage, setSyncMessage] = useState<string | null>(null);
+  // True while the initial post-sign-in download/merge is in flight, so the auto-upload effect
+  // doesn't race it by uploading stale local data before the merge has happened.
+  const isMergingRef = useRef(false);
+
+  useEffect(() => {
+    return onAuthStateChanged((user) => {
+      setCurrentUser(user);
+    });
+  }, []);
+
+  // When someone signs in, reconcile local data with whatever's already in the cloud for that
+  // account (if anything), rather than just blindly overwriting one with the other.
+  useEffect(() => {
+    if (!currentUser) return;
+
+    let cancelled = false;
+    (async () => {
+      isMergingRef.current = true;
+      setSyncStatus('syncing');
+      try {
+        const cloudData = await downloadSyncData();
+        if (cancelled) return;
+
+        const localData = { sessions, incompleteSessions };
+
+        if (cloudData === null) {
+          // First time this account has ever synced — upload local data as-is.
+          await uploadSyncData(localData);
+          setSyncMessage(sessions.length > 0 ? `Backed up ${sessions.length} session(s) to your account.` : null);
+        } else {
+          const merged = mergeSyncPayloads(localData, cloudData);
+          const newlyAdded = merged.sessions.length - sessions.length;
+          setSessions(merged.sessions);
+          setIncompleteSessions(merged.incompleteSessions);
+          await uploadSyncData(merged); // keep the cloud consistent with the merged result
+          setSyncMessage(newlyAdded > 0 ? `Synced ${newlyAdded} session(s) from your other device(s).` : 'Synced — all caught up.');
+        }
+        setSyncStatus('idle');
+      } catch (e: any) {
+        console.error('Initial sync failed:', e);
+        if (!cancelled) {
+          setSyncStatus('error');
+          setSyncMessage(`Sync failed: ${e.message || 'unknown error'}`);
+        }
+      } finally {
+        isMergingRef.current = false;
+      }
+    })();
+
+    return () => { cancelled = true; };
+    // Intentionally only re-runs when the signed-in user changes, not on every session change
+    // (the separate auto-upload effect below handles ongoing syncing after this initial merge).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentUser]);
+
+  // After the initial merge, keep the cloud up to date as sessions change locally.
+  useEffect(() => {
+    if (!currentUser || isMergingRef.current) return;
+    uploadSyncData({ sessions, incompleteSessions }).catch((e) => {
+      console.warn('Background sync upload failed (will retry on next change):', e);
+    });
+  }, [currentUser, sessions, incompleteSessions]);
+
+  const handleSignIn = async () => {
+    setSyncStatus('signing-in');
+    setSyncMessage(null);
+    try {
+      await signInWithGoogle();
+      // onAuthStateChanged + the merge effect above take it from here.
+    } catch (e: any) {
+      console.error('Sign-in failed:', e);
+      setSyncStatus('error');
+      setSyncMessage(`Sign-in failed: ${e.message || 'unknown error'}`);
+    }
+  };
+
+  const handleSignOut = async () => {
+    await signOutUser();
+    setSyncMessage(null);
+    setSyncStatus('idle');
+    // Local data is left exactly as-is — signing out never deletes anything on this device.
+  };
 
   useEffect(() => {
     try {
@@ -362,18 +451,49 @@ const App: React.FC = () => {
             <SparklesIcon className="w-8 h-8"/>
             <h1 className="text-xl sm:text-2xl font-bold tracking-tight">Oto Boards Prep AI</h1>
           </div>
-          {view !== 'dashboard' && (
-            <button
-              onClick={view === 'test' ? saveAndExit : navigateToDashboard}
-              className="flex items-center space-x-2 text-sm font-semibold hover:bg-white/20 px-3 py-2 rounded-md transition-colors"
-            >
-              <ChartBarIcon className="w-5 h-5" />
-              <span>{view === 'test' ? 'Save & Exit' : 'Dashboard'}</span>
-            </button>
-          )}
+          <div className="flex items-center gap-3">
+            {isSyncConfigured && (
+              currentUser ? (
+                <div className="flex items-center gap-2 text-sm">
+                  {currentUser.photoURL ? (
+                    <img src={currentUser.photoURL} alt="" className="w-6 h-6 rounded-full" referrerPolicy="no-referrer" />
+                  ) : (
+                    <UserCircleIcon className="w-6 h-6" />
+                  )}
+                  <span className="hidden sm:inline max-w-[140px] truncate">{currentUser.displayName || currentUser.email}</span>
+                  <button onClick={handleSignOut} className="text-xs font-semibold underline hover:text-white/80">Sign out</button>
+                </div>
+              ) : (
+                <button
+                  onClick={handleSignIn}
+                  disabled={syncStatus === 'signing-in'}
+                  className="flex items-center gap-2 text-sm font-semibold bg-white/10 hover:bg-white/20 px-3 py-2 rounded-md transition-colors disabled:opacity-50"
+                  title="Sign in to sync your sessions across devices"
+                >
+                  <UserCircleIcon className="w-5 h-5" />
+                  <span>{syncStatus === 'signing-in' ? 'Signing in…' : 'Sign in to sync'}</span>
+                </button>
+              )
+            )}
+            {view !== 'dashboard' && (
+              <button
+                onClick={view === 'test' ? saveAndExit : navigateToDashboard}
+                className="flex items-center space-x-2 text-sm font-semibold hover:bg-white/20 px-3 py-2 rounded-md transition-colors"
+              >
+                <ChartBarIcon className="w-5 h-5" />
+                <span>{view === 'test' ? 'Save & Exit' : 'Dashboard'}</span>
+              </button>
+            )}
+          </div>
         </div>
       </header>
       <main className="container mx-auto p-4 sm:p-6 lg:p-8">
+        {syncMessage && (
+          <div className={`mb-6 p-3 rounded-lg text-sm flex items-center justify-between gap-3 ${syncStatus === 'error' ? 'bg-red-50 text-red-700' : 'bg-blue-50 text-blue-700'}`}>
+            <span>{syncMessage}</span>
+            <button onClick={() => setSyncMessage(null)} className="text-current opacity-60 hover:opacity-100 font-bold px-1">&times;</button>
+          </div>
+        )}
         {error && (
           <div className="bg-red-50 border-l-4 border-red-500 text-red-800 p-5 rounded-xl mb-6 shadow-sm flex flex-col md:flex-row md:items-center justify-between gap-4" role="alert">
             <div className="space-y-1 max-w-3xl">

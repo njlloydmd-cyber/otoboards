@@ -7,6 +7,7 @@ import { createServer as createViteServer } from "vite";
 import Anthropic from "@anthropic-ai/sdk";
 import { initializeApp, cert, type ServiceAccount } from "firebase-admin/app";
 import { getFirestore, FieldValue, type Firestore, type Query } from "firebase-admin/firestore";
+import { getAuth, type DecodedIdToken } from "firebase-admin/auth";
 import { Difficulty, Subspecialty } from './types';
 import { getFilteredCuratedQuestions } from './curatedQuestions';
 
@@ -45,11 +46,12 @@ async function startServer() {
     return aiInstance;
   }
 
-  // The shared Question Bank lives in Firestore — separate infrastructure from Claude, used only
-  // for the "Question Bank" source mode (curated questions, sampled with zero AI calls).
-  let firestoreDb: Firestore | null = null;
-  function getBankDb(): Firestore {
-    if (!firestoreDb) {
+  // The shared Question Bank, and (optionally) per-user cross-device sync data, both live in
+  // Firestore. Auth (for sync) shares the same underlying Firebase app — initializeApp() can
+  // only be called once, so both getBankDb() and verifyAuthToken() route through this.
+  let firebaseApp: ReturnType<typeof initializeApp> | null = null;
+  function getFirebaseApp(): ReturnType<typeof initializeApp> {
+    if (!firebaseApp) {
       const encoded = process.env.FIREBASE_SERVICE_ACCOUNT_BASE64;
       if (!encoded) {
         throw new Error("FIREBASE_SERVICE_ACCOUNT_BASE64 environment variable is not configured on the server. See README.md for setup instructions.");
@@ -60,8 +62,15 @@ async function startServer() {
       } catch (e: any) {
         throw new Error(`FIREBASE_SERVICE_ACCOUNT_BASE64 could not be decoded as base64-encoded JSON: ${e.message}`);
       }
-      initializeApp({ credential: cert(serviceAccount) });
-      firestoreDb = getFirestore();
+      firebaseApp = initializeApp({ credential: cert(serviceAccount) });
+    }
+    return firebaseApp;
+  }
+
+  let firestoreDb: Firestore | null = null;
+  function getBankDb(): Firestore {
+    if (!firestoreDb) {
+      firestoreDb = getFirestore(getFirebaseApp());
     }
     return firestoreDb;
   }
@@ -72,6 +81,31 @@ async function startServer() {
   function questionBankDocId(questionText: string): string {
     const normalized = questionText.trim().toLowerCase().replace(/\s+/g, " ");
     return crypto.createHash("sha256").update(normalized).digest("hex").slice(0, 40);
+  }
+
+  class UnauthorizedError extends Error {}
+
+  // Verifies the Firebase Auth ID token the client sends with sync requests, returning the
+  // decoded token (which includes the verified, server-trusted uid) or throwing if missing/
+  // invalid/expired. This is what scopes each person's synced sessions to only them.
+  async function verifyAuthToken(req: express.Request): Promise<DecodedIdToken> {
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith("Bearer ")) {
+      throw new UnauthorizedError("Missing sign-in token.");
+    }
+    const idToken = authHeader.slice("Bearer ".length);
+    let app: ReturnType<typeof initializeApp>;
+    try {
+      app = getFirebaseApp();
+    } catch (e: any) {
+      // Distinct from an actually-invalid token — this means Firebase itself isn't configured.
+      throw e;
+    }
+    try {
+      return await getAuth(app).verifyIdToken(idToken);
+    } catch (e: any) {
+      throw new UnauthorizedError(`Invalid or expired sign-in token: ${e.message}`);
+    }
   }
 
   // A hard stop for cases where retrying or falling back to another model cannot possibly help
@@ -756,6 +790,52 @@ Your active review keeps this board preparation study bank clean, clear, and acc
     } catch (e: any) {
       console.error("Error sampling question bank:", e);
       res.status(e instanceof Error && e.message.includes("FIREBASE_SERVICE_ACCOUNT_BASE64") ? 503 : 500).json({ error: e.message || "Failed to sample the question bank." });
+    }
+  });
+
+  // ----------------------------------------------------------------------------------------
+  // Cross-device sync — optional. A signed-in person's sessions/incompleteSessions are stored
+  // under their verified uid, completely separate from the shared, anonymous Question Bank
+  // above. Each person's data lives in a single document (users/{uid}/sync/main) rather than
+  // one Firestore document per session — simpler to read/write atomically, and comfortably
+  // within Firestore's 1MiB-per-document limit for the realistic range of session history a
+  // single studier accumulates. Documents (uploaded PDFs/text) are intentionally NOT synced —
+  // only sessions and in-progress sessions — to keep each sync payload small and fast.
+  app.post("/api/sync/upload", async (req, res) => {
+    try {
+      const decoded = await verifyAuthToken(req);
+      const db = getBankDb();
+      const { sessions, incompleteSessions } = req.body;
+      if (!Array.isArray(sessions) || typeof incompleteSessions !== "object" || incompleteSessions === null) {
+        return res.status(400).json({ error: "sessions (array) and incompleteSessions (object) are required." });
+      }
+      await db.collection("users").doc(decoded.uid).collection("sync").doc("main").set({
+        sessions,
+        incompleteSessions,
+        updatedAt: FieldValue.serverTimestamp(),
+      });
+      res.json({ success: true });
+    } catch (e: any) {
+      console.error("Error uploading sync data:", e);
+      const status = e instanceof UnauthorizedError ? 401 : (e instanceof Error && e.message.includes("FIREBASE_SERVICE_ACCOUNT_BASE64") ? 503 : 500);
+      res.status(status).json({ error: e.message || "Failed to sync your data." });
+    }
+  });
+
+  app.get("/api/sync/download", async (req, res) => {
+    try {
+      const decoded = await verifyAuthToken(req);
+      const db = getBankDb();
+      const doc = await db.collection("users").doc(decoded.uid).collection("sync").doc("main").get();
+      if (!doc.exists) {
+        return res.json(null);
+      }
+      const data = doc.data() || {};
+      res.json({ sessions: data.sessions || [], incompleteSessions: data.incompleteSessions || {} });
+    } catch (e: any) {
+      console.error("Error downloading sync data:", e);
+      const status = e instanceof UnauthorizedError ? 401 : (e instanceof Error && e.message.includes("FIREBASE_SERVICE_ACCOUNT_BASE64") ? 503 : 500);
+      res.status(status).json({ error: e.message || "Failed to load your synced data." });
     }
   });
 
