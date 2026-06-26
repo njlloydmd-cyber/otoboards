@@ -23,6 +23,25 @@ export const isSyncConfigured = Boolean(
     firebaseConfig.apiKey && firebaseConfig.authDomain && firebaseConfig.projectId && firebaseConfig.appId
 );
 
+// Diagnostic: reports exactly which of the four values made it into this build, without
+// exposing their actual values (not that they're secret, but no reason to print them either).
+// Check the browser console if the "Sign in to sync" button isn't appearing — this tells you
+// directly which env var(s) didn't make it into the build, instead of having to guess from a
+// dashboard listing.
+if (!isSyncConfigured) {
+    const status = {
+        VITE_FIREBASE_API_KEY: firebaseConfig.apiKey ? 'present' : 'MISSING',
+        VITE_FIREBASE_AUTH_DOMAIN: firebaseConfig.authDomain ? 'present' : 'MISSING',
+        VITE_FIREBASE_PROJECT_ID: firebaseConfig.projectId ? 'present' : 'MISSING',
+        VITE_FIREBASE_APP_ID: firebaseConfig.appId ? 'present' : 'MISSING',
+    };
+    console.warn(
+        '[OTOBOARDS] Cross-device sync is disabled because one or more Firebase config values are missing from this build:',
+        status,
+        '\nIf you expected this to be configured: these are read at BUILD time (not runtime), so adding/fixing them requires a fresh deploy, not just a restart.'
+    );
+}
+
 let app: FirebaseApp | null = null;
 let auth: Auth | null = null;
 
