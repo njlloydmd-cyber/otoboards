@@ -3,11 +3,13 @@ services:
     name: otoboards
     runtime: node
     plan: free
-    buildCommand: npm install && npm run build
-    startCommand: npm start
+    buildCommand: npm install --include=dev && npm run build
+    # NODE_ENV is set here, not as a service-level env var, so it only applies at
+    # runtime — not during `npm install` in the build step. Setting it globally would
+    # make `npm install` silently skip devDependencies (vite, esbuild, etc.), which
+    # breaks the build with a "command not found" error.
+    startCommand: NODE_ENV=production npm start
     envVars:
-      - key: NODE_ENV
-        value: production
       # Render prompts you to fill these in during the Blueprint creation flow.
       # Get ANTHROPIC_API_KEY from https://console.anthropic.com/settings/keys
       - key: ANTHROPIC_API_KEY
