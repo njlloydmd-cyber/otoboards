@@ -1250,6 +1250,19 @@ const SetupScreen: React.FC<SetupScreenProps> = ({ onStartTest, onBack, allUploa
     };
 
     const isStillProcessing = !useBankOnly && processingDocs.some(d => d.status === 'parsing');
+
+    // Tracks how long the current batch of document processing has been running, so a slow
+    // (but working) large PDF can show a reassuring "this is normal" note instead of just
+    // looking stuck with no sense of elapsed time.
+    const [processingSeconds, setProcessingSeconds] = useState(0);
+    useEffect(() => {
+        if (!isStillProcessing) {
+            setProcessingSeconds(0);
+            return;
+        }
+        const interval = setInterval(() => setProcessingSeconds(s => s + 1), 1000);
+        return () => clearInterval(interval);
+    }, [isStillProcessing]);
     const hasOnlyFailedDocs = !useBankOnly && useDocuments && allUploadedDocuments.length === 0 && processingDocs.length > 0 && processingDocs.every(d => d.status === 'error');
 
     const isSubmitDisabled = useBankOnly
@@ -1361,6 +1374,11 @@ const SetupScreen: React.FC<SetupScreenProps> = ({ onStartTest, onBack, allUploa
                                                 {doc.status === 'ready' && <span> · {wordCount.toLocaleString()} words</span>}
                                             </p>
                                             {doc.status === 'error' && <p className="text-xs text-red-600 mt-0.5">{doc.error}</p>}
+                                            {doc.status === 'parsing' && processingSeconds > 20 && (
+                                                <p className="text-xs text-slate-400 mt-0.5">
+                                                    Still working ({processingSeconds}s) — larger PDFs and scanned documents take longer. Not stuck.
+                                                </p>
+                                            )}
                                         </div>
                                     </div>
                                     <div className="flex items-center gap-2 flex-shrink-0">
@@ -1507,6 +1525,7 @@ const GeneratingTestScreen: React.FC<{ session: TestSession }> = ({ session }) =
         "Focusing on the latest AAO-HNS guidelines...",
     ], []);
     const [messageIndex, setMessageIndex] = useState(0);
+    const [secondsElapsed, setSecondsElapsed] = useState(0);
 
     useEffect(() => {
         const interval = setInterval(() => {
@@ -1514,6 +1533,15 @@ const GeneratingTestScreen: React.FC<{ session: TestSession }> = ({ session }) =
         }, 3000); // Change message every 3 seconds
         return () => clearInterval(interval);
     }, [messages.length]);
+
+    useEffect(() => {
+        const interval = setInterval(() => setSecondsElapsed(s => s + 1), 1000);
+        return () => clearInterval(interval);
+    }, []);
+
+    // Larger requests produce proportionally more output, which genuinely takes longer to
+    // generate — set a real expectation instead of leaving the person to wonder if it's stuck.
+    const expectedSeconds = Math.round(30 + session.questionCount * 4);
 
     return (
         <div className="max-w-4xl mx-auto">
@@ -1530,6 +1558,14 @@ const GeneratingTestScreen: React.FC<{ session: TestSession }> = ({ session }) =
                 <div className="w-16 h-16 border-4 border-slate-200 border-t-primary rounded-full animate-spinner mb-6"></div>
                 <h2 className="text-xl font-bold text-primary mb-4">Generating Your Questions</h2>
                 <p className="text-slate-500 animate-pulse transition-opacity duration-500">{messages[messageIndex]}</p>
+                <p className="text-xs text-slate-400 mt-4">{secondsElapsed}s elapsed</p>
+                {secondsElapsed > 20 && (
+                    <p className="text-xs text-slate-400 mt-2 max-w-sm">
+                        {session.questionCount > 15
+                            ? `Larger sets take longer to write — ${session.questionCount} questions typically takes around ${expectedSeconds}s. This is normal, not stuck.`
+                            : "This usually finishes within a minute. Still working — not stuck."}
+                    </p>
+                )}
             </Card>
         </div>
     );

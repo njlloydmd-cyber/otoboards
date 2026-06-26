@@ -1,11 +1,36 @@
 import { Difficulty, Question, Subspecialty } from '../types';
 
-async function safeFetch<T>(url: string, body: any): Promise<T> {
-    const response = await fetch(url, {
+// Without this, a stalled request (Render's free tier waking from sleep, a slow Claude
+// response, a network hiccup) would leave fetch() pending indefinitely — the UI would just
+// sit there with no error and nothing to retry. This guarantees every call eventually fails
+// clearly if it doesn't complete in time, so the existing error/retry UI can take over.
+async function fetchWithTimeout(url: string, options: RequestInit, timeoutMs: number): Promise<Response> {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+        return await fetch(url, { ...options, signal: controller.signal });
+    } catch (error: any) {
+        if (error.name === 'AbortError') {
+            throw new Error(`Request timed out after ${Math.round(timeoutMs / 1000)}s. The server may be waking up from sleep (free-tier services do this) or experiencing high demand — please try again.`);
+        }
+        throw error;
+    } finally {
+        clearTimeout(timeoutId);
+    }
+}
+
+// Generous timeout for calls that may involve a large document or a large requested question
+// count (output scales with count — 30 questions can need ~35,000 output tokens, which can
+// legitimately take several minutes to generate). Short timeout for trivial calls.
+const LONG_TIMEOUT_MS = 240_000;
+const SHORT_TIMEOUT_MS = 30_000;
+
+async function safeFetch<T>(url: string, body: any, timeoutMs: number = LONG_TIMEOUT_MS): Promise<T> {
+    const response = await fetchWithTimeout(url, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
-    });
+    }, timeoutMs);
 
     const responseText = await response.text();
 
@@ -46,7 +71,7 @@ async function safeFetch<T>(url: string, body: any): Promise<T> {
 
 export const nameDocument = async (documentText: string): Promise<string> => {
     try {
-        const data = await safeFetch<{ title: string }>("/api/claude/name-document", { documentText });
+        const data = await safeFetch<{ title: string }>("/api/claude/name-document", { documentText }, SHORT_TIMEOUT_MS);
         return data.title;
     } catch (error: any) {
         console.error("Error generating document name client side:", error);
@@ -78,7 +103,7 @@ export const askFollowUpQuestion = async (
   userQuery: string
 ): Promise<string> => {
     try {
-        const data = await safeFetch<{ answer: string }>("/api/claude/ask-followup", { question, userQuery });
+        const data = await safeFetch<{ answer: string }>("/api/claude/ask-followup", { question, userQuery }, SHORT_TIMEOUT_MS);
         return data.answer;
     } catch (error: any) {
         console.error("Error asking follow-up question client side:", error);
@@ -91,7 +116,7 @@ export const reportQuestionError = async (
   userFeedback: string
 ): Promise<string> => {
     try {
-        const data = await safeFetch<{ answer: string }>("/api/claude/report-error", { question, userFeedback });
+        const data = await safeFetch<{ answer: string }>("/api/claude/report-error", { question, userFeedback }, SHORT_TIMEOUT_MS);
         return data.answer;
     } catch (error: any) {
         console.error("Error reporting question error client side:", error);

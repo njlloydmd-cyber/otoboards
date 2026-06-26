@@ -1,11 +1,30 @@
 import { Difficulty, Question, Subspecialty } from '../types';
 
-async function safeFetch<T>(url: string, body: any): Promise<T> {
-    const response = await fetch(url, {
+// See claudeService.ts for why this exists — without it, a stalled request just hangs the UI
+// forever with no error and nothing to retry.
+async function fetchWithTimeout(url: string, options: RequestInit, timeoutMs: number): Promise<Response> {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+        return await fetch(url, { ...options, signal: controller.signal });
+    } catch (error: any) {
+        if (error.name === 'AbortError') {
+            throw new Error(`Request timed out after ${Math.round(timeoutMs / 1000)}s. The server may be waking up from sleep (free-tier services do this) or experiencing high demand — please try again.`);
+        }
+        throw error;
+    } finally {
+        clearTimeout(timeoutId);
+    }
+}
+
+const DEFAULT_TIMEOUT_MS = 30_000;
+
+async function safeFetch<T>(url: string, body: any, timeoutMs: number = DEFAULT_TIMEOUT_MS): Promise<T> {
+    const response = await fetchWithTimeout(url, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
-    });
+    }, timeoutMs);
 
     const responseText = await response.text();
 
@@ -37,7 +56,14 @@ export const addQuestionToBank = async (question: Question): Promise<{ added: bo
 
 export const getQuestionBankCount = async (): Promise<number> => {
     try {
-        const response = await fetch("/api/bank/count");
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), DEFAULT_TIMEOUT_MS);
+        let response: Response;
+        try {
+            response = await fetch("/api/bank/count", { signal: controller.signal });
+        } finally {
+            clearTimeout(timeoutId);
+        }
         if (!response.ok) {
             const data = await response.json().catch(() => ({}));
             throw new Error(data.error || `Server returned ${response.status}`);
@@ -45,6 +71,9 @@ export const getQuestionBankCount = async (): Promise<number> => {
         const data = await response.json();
         return data.count ?? 0;
     } catch (error: any) {
+        if (error.name === 'AbortError') {
+            throw new Error(`Request timed out after ${Math.round(DEFAULT_TIMEOUT_MS / 1000)}s.`);
+        }
         console.error("Error reading question bank count:", error);
         throw error;
     }
