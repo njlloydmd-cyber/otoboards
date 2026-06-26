@@ -1551,7 +1551,9 @@ const SetupScreen: React.FC<SetupScreenProps> = ({ onStartTest, onBack, allUploa
                                             {doc.status === 'error' && <p className="text-xs text-red-600 mt-0.5">{doc.error}</p>}
                                             {doc.status === 'parsing' && processingSeconds > 20 && (
                                                 <p className="text-xs text-slate-400 mt-0.5">
-                                                    Still working ({processingSeconds}s) — larger PDFs and scanned documents take longer. Not stuck.
+                                                    {processingSeconds > 90
+                                                        ? `Still working (${processingSeconds}s) — large or scanned multi-page PDFs are processed in stages and can take several minutes. Not stuck.`
+                                                        : `Still working (${processingSeconds}s) — larger PDFs and scanned documents take longer. Not stuck.`}
                                                 </p>
                                             )}
                                         </div>

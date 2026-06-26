@@ -22,7 +22,12 @@ async function fetchWithTimeout(url: string, options: RequestInit, timeoutMs: nu
 // Generous timeout for calls that may involve a large document or a large requested question
 // count (output scales with count — 30 questions can need ~35,000 output tokens, which can
 // legitimately take several minutes to generate). Short timeout for trivial calls.
-const LONG_TIMEOUT_MS = 240_000;
+// Generous timeout for calls that may involve a large document or a large requested question
+// count (output scales with count — 30 questions can need ~35,000 output tokens, which can
+// legitimately take several minutes to generate). Large/scanned PDFs are processed in chunks
+// with limited concurrency (memory safety on constrained hosting), so multiple chunks can take
+// several sequential rounds rather than all finishing in parallel — budget accordingly.
+const LONG_TIMEOUT_MS = 420_000;
 const SHORT_TIMEOUT_MS = 30_000;
 
 async function safeFetch<T>(url: string, body: any, timeoutMs: number = LONG_TIMEOUT_MS): Promise<T> {
