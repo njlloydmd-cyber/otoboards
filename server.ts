@@ -188,6 +188,44 @@ async function startServer() {
     return textBlock ? textBlock.text.trim() : "";
   }
 
+  // Forces transcription calls through tool use rather than free-form text. Without this, a
+  // model can end up "talking to the user" instead of transcribing — e.g. second-guessing a
+  // page-range hint against what it actually sees in front of it, and writing a confused
+  // clarifying message instead of just transcribing the content. Tool-forcing makes that
+  // failure mode far less likely, the same way it already does for question generation.
+  const transcriptionTool: Anthropic.Tool = {
+    name: "submit_transcription",
+    description: "Submit the transcribed text.",
+    input_schema: {
+      type: "object",
+      properties: {
+        transcribed_text: { type: "string", description: "The full transcribed text, exactly as written in the source — no commentary, no meta-discussion." },
+      },
+      required: ["transcribed_text"],
+    },
+  };
+
+  function getTranscriptionFromMessage(message: Anthropic.Message): string {
+    const toolUseBlock = message.content.find((b): b is Anthropic.ToolUseBlock => b.type === "tool_use");
+    const text = (toolUseBlock?.input as any)?.transcribed_text;
+    return typeof text === "string" ? text.trim() : "";
+  }
+
+  // Defense in depth, in case tool-forcing doesn't fully prevent it: catches the case where the
+  // model writes a refusal/clarifying-question/meta-commentary INTO the transcription field
+  // itself, rather than actual document content. A real transcription of a textbook page is
+  // not going to contain phrasing like this.
+  function looksLikeRefusalOrCommentary(text: string): boolean {
+    const lower = text.toLowerCase();
+    const redFlags = [
+      "i cannot", "i can't", "i don't have", "i do not have", "i'm only seeing", "i am only seeing",
+      "no pages", "not included", "not visible in", "as you've shared", "as you have shared",
+      "the document provided", "i can only work with", "let me know if you'd like",
+      "the materials you have provided", "the materials you've provided", "i'd be happy to",
+    ];
+    return redFlags.some((flag) => lower.includes(flag));
+  }
+
   // --- JSON Schema for forced structured output via tool use ---
   // Claude is instructed (via tool_choice) to always call this tool, so its arguments are
   // guaranteed to be a parsed object matching this schema — no JSON.parse / markdown-fence
@@ -354,14 +392,16 @@ async function startServer() {
                   { type: "document", source: { type: "base64", media_type: "application/pdf", data: base64Data } },
                   {
                     type: "text",
-                    text: `You are an expert medical document transcriber. Transcribe this entire document ("${fileName}") to clean, readable text. Include all body text, headings, tables (as plain text), staging criteria, and numeric values exactly as written. Do not summarize, paraphrase, or omit content — this transcription will be used to write accurate exam questions. Return only the transcribed text, with no preamble or commentary.`,
+                    text: `You are an expert medical document transcriber. Transcribe this entire document ("${fileName}") to clean, readable text. Include all body text, headings, tables (as plain text), staging criteria, and numeric values exactly as written. Do not summarize, paraphrase, or omit content — this transcription will be used to write accurate exam questions. Call the submit_transcription tool with the result; do not write anything outside of that tool call.`,
                   },
                 ],
               },
             ],
+            tools: [transcriptionTool],
+            tool_choice: { type: "tool", name: "submit_transcription" },
           });
-          const text = getTextFromMessage(response);
-          if (!text) {
+          const text = getTranscriptionFromMessage(response);
+          if (!text || looksLikeRefusalOrCommentary(text)) {
             return res.status(422).json({ error: "Claude could not extract any text from this PDF. It may be blank, password-protected, or made up of unreadable images." });
           }
           return res.json({ text, method: "claude-vision" });
@@ -386,13 +426,25 @@ async function startServer() {
                       { type: "document", source: { type: "base64", media_type: "application/pdf", data: chunk.base64 } },
                       {
                         type: "text",
-                        text: `You are an expert medical document transcriber. Transcribe pages ${chunk.startPage}-${chunk.endPage} of "${fileName}" (a partial excerpt from a larger document — only transcribe what's shown, don't comment on it being a fragment) to clean, readable text. Include all body text, headings, tables (as plain text), staging criteria, and numeric values exactly as written. Do not summarize, paraphrase, or omit content. Return only the transcribed text, with no preamble or commentary.`,
+                        // Deliberately does NOT assert this excerpt's position (e.g. "pages 9-16") within
+                        // the original document — each chunk is its own self-contained PDF that Claude
+                        // will perceive as starting at page 1, and telling it otherwise creates a mismatch
+                        // it may try to "resolve" by second-guessing what it's looking at instead of just
+                        // transcribing it.
+                        text: `You are an expert medical document transcriber. This is one excerpt from a larger multi-page document called "${fileName}". Transcribe every page of THIS excerpt, exactly as shown, to clean, readable text. Include all body text, headings, tables (as plain text), staging criteria, and numeric values exactly as written. Do not summarize, paraphrase, or omit content. Do not comment on this being an excerpt, ask about missing pages, or write anything other than the transcription itself — call the submit_transcription tool with the result.`,
                       },
                     ],
                   },
                 ],
+                tools: [transcriptionTool],
+                tool_choice: { type: "tool", name: "submit_transcription" },
               });
-              return { startPage: chunk.startPage, text: getTextFromMessage(response) };
+              const text = getTranscriptionFromMessage(response);
+              if (looksLikeRefusalOrCommentary(text)) {
+                console.warn(`Chunk pages ${chunk.startPage}-${chunk.endPage} of "${fileName}" returned refusal-like content instead of a transcription; treating as failed:`, text.slice(0, 200));
+                return { startPage: chunk.startPage, text: "" };
+              }
+              return { startPage: chunk.startPage, text };
             } catch (chunkError: any) {
               console.warn(`Chunk pages ${chunk.startPage}-${chunk.endPage} of "${fileName}" failed to transcribe:`, chunkError);
               return { startPage: chunk.startPage, text: "" };
@@ -426,13 +478,15 @@ async function startServer() {
               role: "user",
               content: [
                 { type: "image", source: { type: "base64", media_type: mimeType as any, data: base64Data } },
-                { type: "text", text: `Transcribe all text visible in this image ("${fileName}") exactly as written. Return only the transcribed text.` },
+                { type: "text", text: `Transcribe all text visible in this image ("${fileName}") exactly as written. Call the submit_transcription tool with the result; do not write anything outside of that tool call.` },
               ],
             },
           ],
+          tools: [transcriptionTool],
+          tool_choice: { type: "tool", name: "submit_transcription" },
         });
-        const text = getTextFromMessage(response);
-        if (!text) {
+        const text = getTranscriptionFromMessage(response);
+        if (!text || looksLikeRefusalOrCommentary(text)) {
           return res.status(422).json({ error: "Claude could not find any readable text in this image." });
         }
         return res.json({ text, method: "claude-vision" });
