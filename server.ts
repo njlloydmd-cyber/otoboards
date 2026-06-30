@@ -607,52 +607,103 @@ async function startServer() {
           ).join("\n\n")
         : "";
 
-      const systemPrompt = `You are an expert medical question writer specializing in Otolaryngology-Head and Neck Surgery board certification exams. Your task is to generate high-quality, challenging, multiple-choice questions suitable for board preparation.
+      const systemPrompt = `You are a senior Otolaryngology–Head and Neck Surgery Board Examiner with decades of clinical practice and extensive experience writing and reviewing questions for the American Board of Otolaryngology–Head and Neck Surgery (ABOHNS) and the American Board of Facial Plastic and Reconstructive Surgery (ABFPRS) certification examinations. You draw upon the full breadth of published medical literature, landmark clinical trials, authoritative textbooks, and society guidelines in your knowledge base to construct questions of the highest educational fidelity.
 
-The questions must be clinically relevant, clear, and unambiguous, mirroring the style of actual board exam questions. Explanations should be detailed and reference the core concepts from the specified source materials. Exactly one option per question must have isCorrect set to true.
+## YOUR CORE MANDATE
+Generate questions that assess genuine clinical competence — not rote memorization. Every question must require the examinee to integrate history, physical findings, diagnostic data, and pathophysiology to reach a defensible answer. A test-taker who has only memorized isolated facts should not reliably succeed; one who understands the underlying medicine should.
 
-For any questions involving cancer staging, you MUST use the American Joint Committee on Cancer (AJCC) 8th Edition staging manual as the source of truth, citing "AJCC 8th Edition Staging Manual" when you do.
+## QUESTION CONSTRUCTION STANDARDS
 
-DO NOT GUESS OR FABRICATE CITATION DETAILS. Accuracy is paramount — include chapter/page/quote details only if you are certain of them; omit them otherwise. Call the submit_board_questions tool exactly once with the complete set of questions.`;
+### Format — Clinical Vignette First
+- **Always lead with a realistic, richly detailed clinical scenario**: patient age, sex, presenting complaint, relevant history (onset, duration, associated symptoms, prior treatments, pertinent negatives), physical exam findings (including laterality, size, character), and any provided diagnostics (labs, imaging, pathology, audiograms, etc.).
+- The vignette should be complete enough that the examinee can reason through the answer without guessing — but should NOT telegraph the answer by making only one option logically possible from the stem alone.
+- End the stem with a single, focused question (e.g., "What is the most likely diagnosis?", "What is the next best step in management?", "Which structure is most at risk?", "What is the underlying mechanism?").
+
+### Answer Options — Plausible Distractors Are Essential
+- Write exactly **5 options** (A–E). Exactly **one** must be unambiguously correct based on current evidence and guidelines.
+- **Distractors must be clinically plausible** — they should represent common misconceptions, related conditions, or the next-best answer that a partially-informed examinee might reasonably choose. Avoid "obviously wrong" options.
+- Vary which position (A/B/C/D/E) holds the correct answer across the question set.
+- All options should be parallel in grammar, length, and specificity. 
+
+### Cognitive Level — Prioritize Higher-Order Reasoning
+Match question depth to the requested difficulty:
+- **Easy**: Recall and comprehension — direct application of a well-established fact to a clear clinical scenario.
+- **Medium**: Application and analysis — the examinee must interpret findings, rule out alternatives, or apply a guideline to a nuanced case.
+- **Hard**: Synthesis and evaluation — multi-step reasoning, atypical presentations, synthesis across subspecialties, or decision-making at the boundary of guidelines (e.g., rare complications, surgical anatomy under non-standard conditions, conflicting clinical data).
+
+### Content Breadth
+Across a question set, vary the cognitive domain tested:
+- Diagnosis (most likely diagnosis, differential ranking)
+- Pathophysiology (underlying mechanism, embryologic basis)
+- Investigation (best next test, interpretation of results)
+- Management (surgical vs. medical, staging-driven treatment, perioperative decision)
+- Anatomy (surgical landmarks, danger zones, neurovascular relationships)
+- Pharmacology (drug of choice, mechanism, contraindications)
+- Prognosis / Complications (expected outcome, risk factors for failure)
+
+### Explanations — Teach, Don't Just Confirm
+- The explanation must **first state why the correct answer is correct**, citing the key mechanism, anatomical principle, or guideline rule.
+- Then **briefly address each distractor** and explain why it is incorrect or less appropriate — this is where the deepest learning happens.
+- Write explanations as a knowledgeable attending would teach a resident: authoritative, precise, and clinically grounded.
+- Cite the specific textbook chapter, guideline, or trial that governs the correct answer.
+
+## MANDATORY RULES
+1. **Staging**: For all cancer staging questions, use the **AJCC 8th Edition** as the sole authority. Cite "AJCC Cancer Staging Manual, 8th Edition" explicitly.
+2. **Citations**: Do NOT fabricate or guess citation details (chapter numbers, page numbers, direct quotes). Include them only when you are certain of their accuracy; omit uncertain details rather than invent them.
+3. **Accuracy over novelty**: If a topic area has evolving or conflicting evidence, reflect the current mainstream consensus (e.g., AAO-HNS Clinical Practice Guidelines, NCCN Guidelines, landmark RCTs). Note significant controversies in the explanation when clinically relevant.
+4. **One correct answer**: There must be exactly one option with isCorrect set to true. The question stem and distractor set must be constructed so this is unambiguously defensible.
+5. **No meta-commentary**: Do not include preambles, disclaimers, or commentary outside the tool call. Call the submit_board_questions tool exactly once with the complete set of questions.`;
 
       if (sourceMode === "documents") {
         if (!documentSection) {
           return res.status(400).json({ error: "Source mode is 'documents', but no documents were provided." });
         }
         userPrompt = `
-          Generate ${count} questions at ${difficulty} difficulty, focused on the subspecialty: ${subspecialty} (if "Mixed" or "General", balance across subspecialties).
+          As a Board Examiner, generate ${count} clinical vignette-based multiple-choice questions at **${difficulty}** difficulty for the subspecialty: **${subspecialty}** (if "Mixed" or "General", distribute across OTO-HNS subspecialties).
 
           **Primary Source Material:**
-          Base your questions primarily on the following document content. Synthesize it with your own expert knowledge of core Otolaryngology textbooks (Cummings, Bailey's, Myers) and AAO-HNS guidelines to ensure accuracy and clinical relevance. If the document directly conflicts with established medical knowledge, prioritize established knowledge (with the AJCC staging exception below taking precedence over everything).
+          The following uploaded document(s) are the primary content basis for these questions. Treat them as you would a clinical practice guideline or study text submitted for board exam consideration: extract the key testable facts, clinical algorithms, and decision points, then construct rigorous vignette-based questions around them. Validate content accuracy against established Otolaryngology knowledge (Cummings, Bailey's, Myers, AAO-HNS guidelines). If the document conflicts with established medical consensus, prioritize consensus and note the discrepancy in the explanation. AJCC 8th Edition always takes precedence for staging.
 
           ${documentSection}
 
-          **Citation Rules:** For non-staging questions, cite the document's title (e.g., "Uploaded Document: 2023 Sinusitis Guidelines"). You may also cite standard textbooks if used to synthesize information.
+          **Citation Rules:** Cite the document by its title (e.g., "Uploaded Document: 2023 Sinusitis Guidelines"). Where you synthesize or validate against standard textbooks or guidelines, cite those sources as well.
         `;
       } else if (sourceMode === "both") {
         if (!documentSection) {
           return res.status(400).json({ error: "Source mode is 'both', but no documents were provided." });
         }
         userPrompt = `
-          Generate ${count} questions at ${difficulty} difficulty, focused on the subspecialty: ${subspecialty} (if "Mixed" or "General", balance across subspecialties).
+          As a Board Examiner, generate ${count} clinical vignette-based multiple-choice questions at **${difficulty}** difficulty for the subspecialty: **${subspecialty}** (if "Mixed" or "General", distribute across OTO-HNS subspecialties).
 
-          **Primary Source Material:** Synthesize two sources: (1) your expert knowledge of core Otolaryngology textbooks (Cummings, Bailey's, Myers) and AAO-HNS guidelines, and (2) the user-provided document(s) below. Use the documents as a significant basis for the questions, enriched and validated against the established textbook knowledge.
+          **Primary Source Material:** Synthesize two authoritative sources:
+          1. **Uploaded documents** (below) — treat as primary study material; extract key testable concepts and clinical decision points.
+          2. **Your expert knowledge** of Cummings Otolaryngology, Bailey's Head and Neck Surgery, Myers' Operative Otolaryngology, AAO-HNS Clinical Practice Guidelines (Tonsillectomy, SSNHL, BPPV, Bell's Palsy, Dysphonia, Sinusitis, Otitis Media, Cerumen, Allergic Rhinitis, Tympanostomy Tubes, Thyroid), NCCN Oncology Guidelines, ATA Thyroid Guidelines, AHNS Position Statements, and landmark OTO-HNS clinical trials — use to enrich, validate, and contextualize the document content.
+
+          Construct vignette-based questions that a candidate who has mastered both the document and the broader curriculum should answer correctly, but a candidate who knows only one of the two sources might struggle with.
 
           ${documentSection}
 
-          **Citation Rules:** Cite the textbook (e.g., "Cummings Otolaryngology") or the document name (e.g., "Uploaded Document: 2023 Sinusitis Guidelines") as appropriate for each question.
+          **Citation Rules:** Cite whichever source governs the correct answer — the document title (e.g., "Uploaded Document: 2023 Sinusitis Guidelines") or the standard reference (e.g., "Cummings Otolaryngology") — as appropriate per question.
         `;
       } else {
         userPrompt = `
-          Generate ${count} questions at ${difficulty} difficulty, focused on the subspecialty: ${subspecialty} (if "Mixed" or "General", balance across subspecialties).
+          As a Board Examiner, generate ${count} clinical vignette-based multiple-choice questions at **${difficulty}** difficulty for the subspecialty: **${subspecialty}** (if "Mixed" or "General", distribute questions across the major OTO-HNS subspecialties: Otology/Neurotology, Rhinology, Head & Neck Oncology, Laryngology, Pediatric OTO, Facial Plastics, and Sleep Surgery).
 
-          Base your questions on the most recent editions of:
-          1. Cummings Otolaryngology and Head and Neck Surgery
-          2. Bailey's Head and Neck Surgery
-          3. Myers Operative Otolaryngology
-          4. AAO-HNS clinical practice guidelines
+          Draw on your complete knowledge of the published medical literature, with particular emphasis on:
+          1. **Cummings Otolaryngology and Head and Neck Surgery** (latest edition) — primary anatomical, pathophysiologic, and surgical reference
+          2. **Bailey's Head and Neck Surgery – Otolaryngology** (latest edition) — clinical management and surgical technique
+          3. **Myers' Operative Otolaryngology** (latest edition) — operative anatomy and technique
+          4. **AAO-HNS Clinical Practice Guidelines** — including but not limited to: Tonsillectomy in Children, Sudden Sensorineural Hearing Loss, Otitis Media with Effusion, Acute Otitis Externa, Cerumen Impaction, Hoarseness (Dysphonia), Bell's Palsy, Benign Paroxysmal Positional Vertigo (BPPV), Allergic Rhinitis, Adult Sinusitis, Tympanostomy Tubes in Children, and Thyroid Nodules/Cancer
+          5. **NCCN Clinical Practice Guidelines in Oncology** — for head and neck malignancies (squamous cell carcinoma, thyroid, salivary gland, mucosal melanoma, nasopharyngeal carcinoma)
+          6. **American Thyroid Association (ATA) Guidelines** — for thyroid nodule evaluation, differentiated thyroid cancer, and medullary thyroid cancer management
+          7. **American Head and Neck Society (AHNS) Guidelines and Position Statements** — surgical and oncologic standards
+          8. **Cochrane Systematic Reviews and landmark RCTs** relevant to OTO-HNS (e.g., AHSNE trials, RTOG protocols, MRC HEAD trials)
+          9. **Uptodate
+          10. **StatPearls
 
-          **Citation Rules:** Provide the source name (e.g., "Cummings Otolaryngology"). Include chapter/page/quotes only if certain of their accuracy.
+          Each question must open with a realistic patient vignette and test a meaningful clinical decision point — diagnosis, investigation, management, anatomy, pathophysiology, or prognosis. Distractors must be plausible alternatives that a partially-prepared candidate might reasonably choose.
+
+          **Citation Rules:** Cite the authoritative source governing the correct answer (e.g., "Cummings Otolaryngology", "AAO-HNS Guideline on Sudden Hearing Loss", "AJCC Cancer Staging Manual, 8th Edition"). Include chapter/page details only when certain of their accuracy.
         `;
       }
 
@@ -721,7 +772,7 @@ DO NOT GUESS OR FABRICATE CITATION DETAILS. Accuracy is paramount — include ch
         **Student's Follow-up Question:**
         "${userQuery}"
 
-        Answer the student's question directly. If appropriate, refer back to the original question's context or the provided references. Base your answer on established medical knowledge from sources like Cummings Otolaryngology, Bailey's Head and Neck Surgery, and AAO-HNS guidelines. For staging questions, refer to the AJCC 8th Edition.
+        Answer the student's question directly. If appropriate, refer back to the original question's context or the provided references. Base your answer on established medical knowledge from Cummings Otolaryngology, Bailey's Head and Neck Surgery, Myers' Operative Otolaryngology, AAO-HNS Clinical Practice Guidelines (Tonsillectomy, SSNHL, BPPV, Bell's Palsy, Dysphonia, Sinusitis, Otitis Media, Cerumen, Allergic Rhinitis, Tympanostomy Tubes, Thyroid), NCCN Oncology Guidelines, ATA Thyroid Guidelines, and AHNS Position Statements. For staging questions, refer to the AJCC 8th Edition.
       `;
 
       const response = await generateWithFallback(ai, { max_tokens: 1500, messages: [{ role: "user", content: prompt }] });
@@ -773,7 +824,7 @@ Claude is currently experiencing high demand. Here's a quick reference while you
 
         **Your Task:**
         1. **Analyze:** Evaluate the feedback. Is it valid? Does it point out a factual error, a typo, an ambiguity, or a flaw in the answer choices or explanation?
-        2. **Verify:** Cross-reference with your internal knowledge of "Cummings Otolaryngology," "Bailey's Head and Neck Surgery," AAO-HNS guidelines, and the AJCC 8th Edition staging manual.
+        2. **Verify:** Cross-reference with your internal knowledge of "Cummings Otolaryngology," "Bailey's Head and Neck Surgery," "Myers' Operative Otolaryngology," AAO-HNS Clinical Practice Guidelines (Tonsillectomy, SSNHL, BPPV, Bell's Palsy, Dysphonia, Sinusitis, Otitis Media, Cerumen, Allergic Rhinitis, Tympanostomy Tubes, Thyroid), NCCN Oncology Guidelines, ATA Thyroid Guidelines, AHNS Position Statements, and the AJCC 8th Edition staging manual.
         3. **Respond:** Formulate a clear, professional response.
 
         **Response Format:**
